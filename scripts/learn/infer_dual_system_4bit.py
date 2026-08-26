@@ -44,6 +44,12 @@ def parse_args():
         help="system2 只运行视觉语言系统；full 继续运行轨迹系统",
     )
     parser.add_argument(
+        "--frame-index",
+        type=int,
+        default=None,
+        help="指定普通 RGB 帧编号，例如 10 对应 debug_raw_0010.jpg",
+    )
+    parser.add_argument(
         "--num-sample-trajs",
         type=int,
         default=32,
@@ -176,14 +182,22 @@ def run(args):
         raise FileNotFoundError(f"找不到普通 RGB 帧：{args.sample_dir}")
 
     instruction = instruction_path.read_text(encoding="utf-8").strip()
-    image_path = rgb_paths[0]
+    if args.frame_index is not None:
+        if args.frame_index < 0:
+            raise ValueError(f"帧编号不能小于 0：{args.frame_index}")
+        image_path = args.sample_dir / f"debug_raw_{args.frame_index:04d}.jpg"
+        if not image_path.is_file():
+            raise FileNotFoundError(f"找不到指定普通 RGB 帧：{image_path}")
+    else:
+        image_path = rgb_paths[0]
+    image_path = image_path.resolve()
     image = Image.open(image_path).convert("RGB")
     image.thumbnail((640, 480), Image.Resampling.LANCZOS)
     depth = np.full((image.height, image.width), 10.0, dtype=np.float32)
 
     print(f"仓库根目录: {REPO_ROOT}")
     print(f"样本目录: {args.sample_dir}")
-    print(f"使用 RGB 帧: {image_path.name}")
+    print(f"使用 RGB 帧绝对路径: {image_path}")
     print(f"指令: {instruction}")
     print("深度输入: 固定 10 米占位值，这不是真实深度估计。")
 

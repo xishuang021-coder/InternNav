@@ -55,6 +55,11 @@ def parse_args():
         help="为指定当前帧加入历史普通 RGB 帧",
     )
     parser.add_argument(
+        "--follow-look-down",
+        action="store_true",
+        help="第一轮 System 2 输出恰好为↓时，追加一轮俯视图片对话",
+    )
+    parser.add_argument(
         "--num-history",
         type=int,
         default=8,
@@ -137,7 +142,7 @@ def classify_system2_output(output):
     return "unknown", None
 
 
-def build_inputs(processor, images, instruction, device, with_history=False):
+def build_system2_messages(images, instruction, with_history=False):
     prompt = (
         "You are an autonomous navigation assistant. "
         "Your task is to <instruction>. "
@@ -166,7 +171,19 @@ def build_inputs(processor, images, instruction, device, with_history=False):
             f"{image_index} != {len(images)}"
         )
 
-    messages = [{"role": "user", "content": content}]
+    return [{"role": "user", "content": content}]
+
+
+def build_inputs(
+    processor,
+    images,
+    instruction,
+    device,
+    with_history=False,
+    messages=None,
+):
+    if messages is None:
+        messages = build_system2_messages(images, instruction, with_history)
     chat_text = processor.apply_chat_template(
         messages,
         tokenize=False,
@@ -263,12 +280,18 @@ def run(args):
     print_peak_memory("模型加载")
 
     device = torch.device("cuda:0")
+    first_messages = build_system2_messages(
+        input_images,
+        instruction,
+        with_history=args.with_history,
+    )
     inputs = build_inputs(
         processor,
         input_images,
         instruction,
         device,
         with_history=args.with_history,
+        messages=first_messages,
     )
     print_tensor_info("System 2 input_ids", inputs.input_ids)
     print_tensor_info("System 2 pixel_values", inputs.pixel_values)
@@ -298,6 +321,65 @@ def run(args):
     output_category, pixel_goal = classify_system2_output(output_text)
     print(f"System 2 解析类别: {output_category}")
     if output_category == "action":
+        if args.follow_look_down and output_text == "↓":
+            look_down_path = (
+                args.sample_dir / f"debug_raw_{current_frame_index:04d}_look_down.jpg"
+            )
+            if not look_down_path.is_file():
+                raise FileNotFoundError(
+                    f"第一轮 System 2 输出为↓，但找不到对应俯视图片：{look_down_path}"
+                )
+            look_down_path = look_down_path.resolve()
+            look_down_image = Image.open(look_down_path).convert("RGB")
+            look_down_image.thumbnail((640, 480), Image.Resampling.LANCZOS)
+            second_images = input_images + [look_down_image]
+            second_messages = first_messages + [
+                {"role": "assistant", "content": output_text},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "you can see "},
+                        {"type": "image", "image": look_down_image},
+                        {"type": "text", "text": "."},
+                    ],
+                },
+            ]
+            second_inputs = build_inputs(
+                processor,
+                second_images,
+                instruction,
+                device,
+                messages=second_messages,
+            )
+            torch.cuda.reset_peak_memory_stats()
+            print(f"俯视图片路径: {look_down_path}")
+            print("System 2 第二轮：根据俯视图片生成方向文字或像素目标……")
+            with torch.inference_mode():
+                second_output_ids = model.generate(
+                    **second_inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                ).sequences
+            second_new_tokens = second_output_ids[
+                0, second_inputs.input_ids.shape[1] :
+            ]
+            second_generated_token_count = second_new_tokens.shape[0]
+            second_output_text = processor.tokenizer.decode(
+                second_new_tokens,
+                skip_special_tokens=True,
+            ).strip()
+            second_category, second_pixel_goal = classify_system2_output(
+                second_output_text
+            )
+            print(f"第二轮 generated token count: {second_generated_token_count}")
+            print(f"第二轮 generated token IDs: {second_new_tokens.tolist()}")
+            print(f"第二轮原始输出 repr(output_text): {second_output_text!r}")
+            print(f"第二轮 System 2 解析类别: {second_category}")
+            if second_category == "coordinate":
+                print(f"像素目标 [y, x]: {second_pixel_goal}")
+            print_peak_memory("System 2 第二轮")
+            return
         print("System 2 输出离散动作；没有像素坐标，因此跳过System 1。")
         return
     if output_category == "unknown":

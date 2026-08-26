@@ -50,6 +50,17 @@ def parse_args():
         help="指定普通 RGB 帧编号，例如 10 对应 debug_raw_0010.jpg",
     )
     parser.add_argument(
+        "--with-history",
+        action="store_true",
+        help="为指定当前帧加入历史普通 RGB 帧",
+    )
+    parser.add_argument(
+        "--num-history",
+        type=int,
+        default=8,
+        help="最多选择的历史普通 RGB 帧数量",
+    )
+    parser.add_argument(
         "--num-sample-trajs",
         type=int,
         default=32,
@@ -126,7 +137,7 @@ def classify_system2_output(output):
     return "unknown", None
 
 
-def build_inputs(processor, image, instruction, device):
+def build_inputs(processor, images, instruction, device, with_history=False):
     prompt = (
         "You are an autonomous navigation assistant. "
         "Your task is to <instruction>. "
@@ -135,6 +146,9 @@ def build_inputs(processor, image, instruction, device):
         "Please output STOP when you have successfully completed the task."
     )
     prompt = prompt.replace("<instruction>.", instruction.strip())
+    if with_history:
+        history_placeholder = "<image>\n" * (len(images) - 1)
+        prompt += f" These are your historical observations: {history_placeholder}."
     prompt += " you can see <image>."
 
     parts = split_and_clean(prompt)
@@ -142,12 +156,15 @@ def build_inputs(processor, image, instruction, device):
     image_index = 0
     for part in parts:
         if part == "<image>":
-            content.append({"type": "image", "image": image})
+            content.append({"type": "image", "image": images[image_index]})
             image_index += 1
         else:
             content.append({"type": "text", "text": part})
-    if image_index != 1:
-        raise ValueError(f"System 2 需要一个图片占位符，实际找到：{image_index}")
+    if image_index != len(images):
+        raise ValueError(
+            f"System 2 图片占位符数量与图片数量不一致："
+            f"{image_index} != {len(images)}"
+        )
 
     messages = [{"role": "user", "content": content}]
     chat_text = processor.apply_chat_template(
@@ -157,12 +174,16 @@ def build_inputs(processor, image, instruction, device):
     )
     return processor(
         text=[chat_text],
-        images=[image],
+        images=images,
         return_tensors="pt",
     ).to(device)
 
 
 def run(args):
+    if args.num_history < 1:
+        raise ValueError(f"--num-history 必须至少为 1：{args.num_history}")
+    if args.with_history and args.frame_index is None:
+        raise ValueError("指定 --with-history 时必须同时指定 --frame-index")
     if not torch.cuda.is_available():
         raise RuntimeError("需要 CUDA GPU；本脚本不会自动改用 CPU。")
     if not args.model_path.is_dir():
@@ -193,11 +214,46 @@ def run(args):
     image_path = image_path.resolve()
     image = Image.open(image_path).convert("RGB")
     image.thumbnail((640, 480), Image.Resampling.LANCZOS)
+    current_frame_index = int(image_path.stem.removeprefix("debug_raw_"))
+    history_paths = []
+    if args.with_history:
+        indexed_rgb_paths = []
+        for path in rgb_paths:
+            frame_index = int(path.stem.removeprefix("debug_raw_"))
+            if frame_index < current_frame_index:
+                indexed_rgb_paths.append((frame_index, path))
+        history_count = min(args.num_history, len(indexed_rgb_paths))
+        if history_count:
+            sample_positions = np.unique(
+                np.linspace(
+                    0,
+                    len(indexed_rgb_paths) - 1,
+                    history_count,
+                    dtype=np.int32,
+                )
+            )
+            history_paths = [indexed_rgb_paths[position][1] for position in sample_positions]
+    history_images = [
+        Image.open(path).convert("RGB") for path in history_paths
+    ]
+    for history_image in history_images:
+        history_image.thumbnail((640, 480), Image.Resampling.LANCZOS)
+    input_images = history_images + [image]
     depth = np.full((image.height, image.width), 10.0, dtype=np.float32)
 
     print(f"仓库根目录: {REPO_ROOT}")
     print(f"样本目录: {args.sample_dir}")
     print(f"使用 RGB 帧绝对路径: {image_path}")
+    print(f"历史帧数量: {len(history_paths)}")
+    print(
+        "历史帧编号: "
+        f"{[int(path.stem.removeprefix('debug_raw_')) for path in history_paths]}"
+    )
+    print(f"当前帧编号: {current_frame_index}")
+    print(
+        "全部图片输入顺序: "
+        f"{[str(path.resolve()) for path in history_paths] + [str(image_path)]}"
+    )
     print(f"指令: {instruction}")
     print("深度输入: 固定 10 米占位值，这不是真实深度估计。")
 
@@ -207,7 +263,13 @@ def run(args):
     print_peak_memory("模型加载")
 
     device = torch.device("cuda:0")
-    inputs = build_inputs(processor, image, instruction, device)
+    inputs = build_inputs(
+        processor,
+        input_images,
+        instruction,
+        device,
+        with_history=args.with_history,
+    )
     print_tensor_info("System 2 input_ids", inputs.input_ids)
     print_tensor_info("System 2 pixel_values", inputs.pixel_values)
 

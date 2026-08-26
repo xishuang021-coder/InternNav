@@ -20,6 +20,15 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_MODEL_PATH = Path.home() / "models" / "InternVLA-N1-DualVLN"
 DEFAULT_SAMPLE_DIR = REPO_ROOT / "assets" / "realworld_sample_data1"
+SYSTEM1_BF16_MODULES = [
+    "traj_dit",
+    "action_encoder",
+    "action_decoder",
+    "cond_projector",
+    "rgb_model",
+    "memory_encoder",
+    "rgb_resampler",
+]
 
 
 def parse_args():
@@ -39,9 +48,9 @@ def parse_args():
     )
     parser.add_argument(
         "--stage",
-        choices=("system2", "full"),
+        choices=("load", "system2", "full"),
         default="system2",
-        help="system2 只运行视觉语言系统；full 继续运行轨迹系统",
+        help="load 只加载并检查模型；system2 只运行视觉语言系统；full 继续运行轨迹系统",
     )
     parser.add_argument(
         "--frame-index",
@@ -101,6 +110,7 @@ def load_model(model_path):
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
+        llm_int8_skip_modules=SYSTEM1_BF16_MODULES,
     )
 
     print("正在加载 processor：它负责把图片和文字整理成模型输入……")
@@ -122,6 +132,26 @@ def load_model(model_path):
     )
     model.eval()
     return processor, model
+
+
+def inspect_system1_modules(model):
+    base_model = model.get_model()
+    for module_name in SYSTEM1_BF16_MODULES:
+        try:
+            module = base_model.get_submodule(module_name)
+        except AttributeError as error:
+            raise AttributeError(
+                f"找不到 System 1 模块：{module_name}"
+            ) from error
+        parameters = list(module.parameters())
+        dtypes = {parameter.dtype for parameter in parameters}
+        parameter_count = sum(parameter.numel() for parameter in parameters)
+        has_uint8 = torch.uint8 in dtypes
+        print(f"System 1 模块: {module_name}")
+        print(f"  模块类型: {type(module).__name__}")
+        print(f"  参数 dtype 集合: {dtypes}")
+        print(f"  参数数量: {parameter_count}")
+        print(f"  是否出现 torch.uint8: {has_uint8}")
 
 
 VALID_ACTIONS = {"STOP", "↑", "←", "→", "↓"}
@@ -205,6 +235,15 @@ def run(args):
         raise RuntimeError("需要 CUDA GPU；本脚本不会自动改用 CPU。")
     if not args.model_path.is_dir():
         raise FileNotFoundError(f"找不到模型目录：{args.model_path}")
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    processor, model = load_model(args.model_path)
+    print_peak_memory("模型加载")
+    if args.stage == "load":
+        inspect_system1_modules(model)
+        return
+
     if not args.sample_dir.is_dir():
         raise FileNotFoundError(f"找不到样本目录：{args.sample_dir}")
 
@@ -274,11 +313,6 @@ def run(args):
     print(f"指令: {instruction}")
     print("深度输入: 固定 10 米占位值，这不是真实深度估计。")
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    processor, model = load_model(args.model_path)
-    print_peak_memory("模型加载")
-
     device = torch.device("cuda:0")
     first_messages = build_system2_messages(
         input_images,
@@ -320,6 +354,9 @@ def run(args):
 
     output_category, pixel_goal = classify_system2_output(output_text)
     print(f"System 2 解析类别: {output_category}")
+    system2_output_ids = output_ids
+    system2_inputs = inputs
+    used_second_coordinate = False
     if output_category == "action":
         if args.follow_look_down and output_text == "↓":
             look_down_path = (
@@ -378,32 +415,46 @@ def run(args):
             print(f"第二轮 System 2 解析类别: {second_category}")
             if second_category == "coordinate":
                 print(f"像素目标 [y, x]: {second_pixel_goal}")
+                system2_output_ids = second_output_ids
+                system2_inputs = second_inputs
+                used_second_coordinate = True
+            else:
+                print("第二轮输出不是坐标；安全跳过 System 1。")
+                return
             print_peak_memory("System 2 第二轮")
+            if args.stage == "system2":
+                print("当前 stage=system2，因此第二轮坐标已获得但不运行 System 1。")
+                return
+            print("System 1 将使用第二轮 System 2 的 coordinate。")
+        if not used_second_coordinate:
+            print("System 2 输出离散动作；没有像素坐标，因此跳过System 1。")
             return
-        print("System 2 输出离散动作；没有像素坐标，因此跳过System 1。")
-        return
     if output_category == "unknown":
         print("System 2 输出无法解析；停止，不进入System 1。")
         return
-    print(f"像素目标 [y, x]: {pixel_goal}")
+    print(
+        f"像素目标 [y, x]: {second_pixel_goal if used_second_coordinate else pixel_goal}"
+    )
 
     if args.stage == "system2":
         print("当前 stage=system2，因此已获得像素目标但不运行 System 1。")
         return
 
+    if used_second_coordinate:
+        print("System 1 使用的是第二轮 coordinate。")
     torch.cuda.reset_peak_memory_stats()
     image_grid_thw = torch.cat(
-        [thw.unsqueeze(0) for thw in inputs.image_grid_thw],
+        [thw.unsqueeze(0) for thw in system2_inputs.image_grid_thw],
         dim=0,
     )
     with torch.inference_mode():
         # generate_latents 把 System 2 的视觉/文字结果变成 System 1 条件。
         traj_latents = model.generate_latents(
-            output_ids,
-            inputs.pixel_values,
+            system2_output_ids,
+            system2_inputs.pixel_values,
             image_grid_thw,
         )
-    print_tensor_info("generate_latents output", traj_latents)
+    print_tensor_info("System 1 latent", traj_latents)
     print_peak_memory("generate_latents")
 
     rgb_array = np.asarray(image).astype(np.float32) / 255.0

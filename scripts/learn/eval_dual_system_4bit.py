@@ -147,7 +147,66 @@ def build_sample_record(scene, frame_index, seed, first_output, second_output, p
     }
 
 
+def parse_action_sequence(output_text):
+    cleaned = (output_text or "").strip()
+    if not cleaned:
+        return []
+    if cleaned.upper() == "STOP":
+        return [0]
+
+    mapping = {"↑": 1, "←": 2, "→": 3, "↓": 4}
+    actions = []
+    for char in cleaned:
+        if char.isspace():
+            continue
+        if char in mapping:
+            actions.append(mapping[char])
+        elif char.upper() == "S":
+            return [0]
+    return actions
+
+
+def validate_record_consistency(record):
+    if record.get("status") == "error":
+        return record
+
+    parse_type = record.get("parse_type")
+    actions = record.get("actions")
+    error_message = None
+
+    if parse_type == "action":
+        if record.get("pixel_x") is not None or record.get("pixel_y") is not None:
+            error_message = "action parse must have pixel_x and pixel_y set to None"
+        elif record.get("latent_shape") is not None or record.get("trajectory_shape") is not None:
+            error_message = "action parse must have latent_shape and trajectory_shape set to None"
+        elif record.get("system1_time_sec") not in (0, 0.0):
+            error_message = "action parse must set system1_time_sec to 0"
+        elif actions is None or record.get("action_count") != len(actions):
+            error_message = "action parse must satisfy action_count == len(actions)"
+    elif parse_type == "coordinate":
+        if record.get("status") == "success":
+            if record.get("pixel_x") is None or record.get("pixel_y") is None:
+                error_message = "coordinate success must include pixel_x and pixel_y"
+            elif not isinstance(record.get("coordinate_in_bounds"), bool):
+                error_message = "coordinate success must set coordinate_in_bounds to a bool"
+            elif record.get("latent_shape") is None or record.get("trajectory_shape") is None:
+                error_message = "coordinate success must include latent_shape and trajectory_shape"
+            elif actions is None or record.get("action_count") != len(actions):
+                error_message = "coordinate success must satisfy action_count == len(actions)"
+
+    if error_message is not None:
+        record["status"] = "consistency_error"
+        record["error"] = (
+            f"consistency_error: {error_message}"
+            if record.get("error") is None
+            else f"{record.get('error')}\nconsistency_error: {error_message}"
+        )
+
+    return record
+
+
 def _run_single_eval_frame(sample_dir: Path, frame_index: int, args, processor, model):
+    set_seed(args.seed)
     helpers = _import_inference_helpers()
     build_inputs = helpers["build_inputs"]
     build_system2_messages = helpers["build_system2_messages"]
@@ -274,6 +333,30 @@ def _run_single_eval_frame(sample_dir: Path, frame_index: int, args, processor, 
         coordinate_in_bounds = None
 
     if args.stage == "system2":
+        if chosen_parse_type == "action":
+            actions = parse_action_sequence(first_output_text if second_output_text == "" else second_output_text)
+            record = build_sample_record(
+                scene=sample_dir.name,
+                frame_index=frame_index,
+                seed=args.seed,
+                first_output=first_output_text,
+                second_output=second_output_text,
+                parse_type="action",
+                pixel_x=None,
+                pixel_y=None,
+                coordinate_in_bounds=None,
+                latent_shape=None,
+                trajectory_shape=None,
+                actions=actions,
+                action_count=len(actions),
+                system2_time=system2_time,
+                system1_time=0.0,
+                peak_memory=torch.cuda.max_memory_allocated(0) / (1024 ** 3) if torch.cuda.is_available() else 0.0,
+                status="success",
+                error=None,
+            )
+            return validate_record_consistency(record)
+
         record = build_sample_record(
             scene=sample_dir.name,
             frame_index=frame_index,
@@ -294,7 +377,31 @@ def _run_single_eval_frame(sample_dir: Path, frame_index: int, args, processor, 
             status="success",
             error=None,
         )
-        return record
+        return validate_record_consistency(record)
+
+    if chosen_parse_type == "action":
+        actions = parse_action_sequence(first_output_text if second_output_text == "" else second_output_text)
+        record = build_sample_record(
+            scene=sample_dir.name,
+            frame_index=frame_index,
+            seed=args.seed,
+            first_output=first_output_text,
+            second_output=second_output_text,
+            parse_type="action",
+            pixel_x=None,
+            pixel_y=None,
+            coordinate_in_bounds=None,
+            latent_shape=None,
+            trajectory_shape=None,
+            actions=actions,
+            action_count=len(actions),
+            system2_time=system2_time,
+            system1_time=0.0,
+            peak_memory=torch.cuda.max_memory_allocated(0) / (1024 ** 3) if torch.cuda.is_available() else 0.0,
+            status="success",
+            error=None,
+        )
+        return validate_record_consistency(record)
 
     image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in chosen_inputs.image_grid_thw], dim=0)
     start_system1 = time.perf_counter()
@@ -354,7 +461,7 @@ def _run_single_eval_frame(sample_dir: Path, frame_index: int, args, processor, 
         status="success",
         error=None,
     )
-    return record
+    return validate_record_consistency(record)
 
 
 def write_summary(results_path: Path, summary_path: Path, output_dir: Path):
@@ -543,8 +650,10 @@ def main():
     processor, model = load_model(args.model_path)
     try:
         for frame_index in selected_frames:
+            set_seed(args.seed)
             try:
                 record = _run_single_eval_frame(args.sample_dir, frame_index, args, processor, model)
+                record = validate_record_consistency(record)
             except Exception as exc:
                 traceback.print_exc()
                 error_text = traceback.format_exc()

@@ -226,7 +226,7 @@ def build_inputs(
     ).to(device)
 
 
-def run(args):
+def run_single_sample(args, processor=None, model=None):
     if args.num_history < 1:
         raise ValueError(f"--num-history 必须至少为 1：{args.num_history}")
     if args.with_history and args.frame_index is None:
@@ -238,7 +238,8 @@ def run(args):
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    processor, model = load_model(args.model_path)
+    if processor is None or model is None:
+        processor, model = load_model(args.model_path)
     print_peak_memory("模型加载")
     if args.stage == "load":
         inspect_system1_modules(model)
@@ -448,7 +449,6 @@ def run(args):
         dim=0,
     )
     with torch.inference_mode():
-        # generate_latents 把 System 2 的视觉/文字结果变成 System 1 条件。
         traj_latents = model.generate_latents(
             system2_output_ids,
             system2_inputs.pixel_values,
@@ -483,6 +483,10 @@ def run(args):
     discrete_actions = traj_to_actions(trajectories.clone())
     print(f"轨迹转换后的离散动作: {discrete_actions}")
     print("full 阶段完成：以上轨迹由 System 1 生成，并已转换为动作。")
+
+
+def run(args):
+    return run_single_sample(args)
 
 
 def main():
